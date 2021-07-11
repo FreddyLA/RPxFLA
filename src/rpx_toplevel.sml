@@ -549,18 +549,77 @@ fun clauseOfFormulaBody (Tptp.FofFormulaBody f) = List.concat (map LiteralSet.to
                             else clauseOfFormulaBody (Tptp.CnfFormulaBody ls))
 
 (* Convert to RP expressions *)
-fun termOfTerm (Term.Var x) = RPx.Var ((Name.toString x)) |
-    termOfTerm (Term.Fn (f,ts)) = RPx.Fun ((Name.toString f), map termOfTerm ts);
-                                         
-exception SZS_Status_Inappropriate
 
-fun termOfAtm (r,ts) = if Name.toString r = "=" andalso not (!EQL) then raise SZS_Status_Inappropriate else RPx.Fun ((Name.toString r), map termOfTerm ts) 
+datatype funType = Eq | Connec | Fun
 
-fun litOfLit (p,a : Atom.atom) = (if p then RPx.Pos else RPx.Neg) (termOfAtm a);
+fun getConnectiveType f =
+	case String.compare(f, "=") of
+		 EQUAL => Eq
+	  |_ => if List.exists Char.isAlpha (String.explode f) then Fun else Connec
+	  
+fun isFunType t =
+	case t of
+	  Fun => true
+     |_ => false
+	 
+fun termOfTerm (Term.Var x) _ = (RPx.Var ((Name.toString x)),NameAritySet.empty,NameAritySet.empty, false, false)  |
+    termOfTerm (Term.Fn (f,ts)) parentConnective = let
+									val connective = getConnectiveType (Name.toString f)
+									val (params, predSet, funSet, containsFun, containsEq) = parseTermList ts connective
+								  in
+								    case parentConnective of
+									   Eq => (RPx.Fun((Name.toString f), params), predSet,NameAritySet.add funSet (f, List.length(ts)), (isFunType connective),true)
+									  |Fun => (RPx.Fun((Name.toString f), params), predSet,NameAritySet.add funSet (f, List.length(ts)), (isFunType connective),containsEq)
+									  |_ => (RPx.Fun((Name.toString f), params), NameAritySet.add predSet (f, List.length(ts)), funSet, (isFunType connective),false)
+								  end
+and parseTermList ts connective =
+	case ts of
+	  [] => ([], NameAritySet.empty,NameAritySet.empty, false, false)
+	 |x::xs => let
+               val (params1, predSet1, funSet1, containsFun1, containsEq1) = termOfTerm x connective
+               val (params2, predSet2, funSet2, containsFun2, containsEq2) = parseTermList xs connective
+             in
+               (params1::params2, NameAritySet.union predSet1 predSet2, NameAritySet.union funSet1 funSet2, containsFun1 orelse containsFun2, containsEq1 orelse containsEq2)
+             end
+			   
 
-fun clauseOfClause cls = map litOfLit cls;
+fun termOfAtm (r,ts) = let
+						 val connective = getConnectiveType (Name.toString r)
+						 val (params, predSet, funSet, _, containsEq) = parseTermList ts connective
+					   in
+						 case connective of
+						    Eq => (RPx.Fun((Name.toString r), params), predSet, funSet,true)
+						   |Fun => (RPx.Fun((Name.toString r), params), NameAritySet.add predSet (r, List.length(ts)),funSet,containsEq)
+						   |_ => (RPx.Fun((Name.toString r), params), predSet,funSet,containsEq)
+					   end
 
-fun clausesOfClauses clss = map clauseOfClause clss;
+
+
+fun litOfLit (p,a : Atom.atom) = let
+                                   val (atm, predSet, funSet, containsEq) = termOfAtm a
+                                 in
+                                   (((if p then RPx.Pos else RPx.Neg) atm), predSet, funSet, containsEq)
+                                 end
+								 
+fun clauseOfClause cls =
+	case cls of
+	  [] => ([], NameAritySet.empty, NameAritySet.empty, false)
+	 |x::xs => let
+               val (lit1, predSet1, funSet1, containsEq1) = litOfLit x
+               val (lit2, predSet2, funSet2, containsEq2) = clauseOfClause xs
+             in
+               (lit1::lit2, NameAritySet.union predSet1 predSet2, NameAritySet.union funSet1 funSet2, containsEq1 orelse containsEq2)
+             end
+			   
+fun clausesOfClauses clss =
+	case clss of
+	  [] => ([], NameAritySet.empty, NameAritySet.empty, false)
+	 |x::xs => let
+               val (lit1, predSet1, funSet1, containsEq1) = clauseOfClause x
+               val (lit2, predSet2, funSet2, containsEq2) = clausesOfClauses xs
+             in
+               (lit1::lit2, (NameAritySet.union predSet1 predSet2), (NameAritySet.union funSet1 funSet2), containsEq1 orelse containsEq2)
+             end
 
 fun wclausesOfClauses clss = map (fn c => (c,RPx.zero_nata)) clss;
 
@@ -637,11 +696,94 @@ fun string_of_clauses cs = "[" ^ string_of_clauses' cs;
 
 fun string_of_wclauses cs = string_of_clauses (map fst cs);
 
+fun makeParameters arity n =
+  case Int.compare(arity, n) of
+    EQUAL => []
+   |_ => (RPx.Var ("Z" ^ Int.toString(n)))::(makeParameters arity (n+1))
+
+fun createPredicateAxiom predicateName arity n =
+  let
+    val eq = RPx.Neg (RPx.Fun ("=", [RPx.Var "X", RPx.Var "Y"]))
+    val params = makeParameters arity 1
+  in
+    case List.length(params) of
+      0 => [eq, RPx.Neg (RPx.Fun (predicateName, [(RPx.Var "X")])), RPx.Pos (RPx.Fun (predicateName, [(RPx.Var "Y")]))]
+     |_ => let
+             val front = List.take(params, n-1)
+             val back = List.drop(params, n-1)
+           in
+             [eq, RPx.Neg (RPx.Fun (predicateName, front @ [(RPx.Var "X")] @ back)), 
+                 RPx.Pos (RPx.Fun (predicateName, front @ [(RPx.Var "Y")] @ back))]
+           end
+  end
+
+fun createNPredicateAxioms predicateName arity n =
+  case n of
+    0 => []
+   |_ => (createPredicateAxiom predicateName arity n)::(createNPredicateAxioms predicateName arity (n-1))
+
+fun createPredicateAxioms predicateName arity =
+  createNPredicateAxioms predicateName arity arity
+
+fun createPredicatesAxioms names =
+  case names of
+    [] => []
+   |(nm,ar)::xs => (createPredicateAxioms (Name.toString nm) ar) @ (createPredicatesAxioms xs)
+
+fun createFunctionAxiom functionName arity n =
+  let
+    val eq = RPx.Neg (RPx.Fun ("=", [RPx.Var "X", RPx.Var "Y"]))
+    val params = makeParameters arity 1
+  in
+    case List.length(params) of
+      0 => [eq, RPx.Pos (RPx.Fun ("=", [RPx.Fun (functionName, [(RPx.Var "X")]), RPx.Fun (functionName, [(RPx.Var "Y")])]))]
+     |_ => let
+             val front = List.take(params, n-1)
+             val back = List.drop(params, n-1)
+           in
+             [eq, RPx.Pos (RPx.Fun ("=", [RPx.Fun (functionName, front @ [(RPx.Var "X")] @ back), 
+                 RPx.Fun (functionName, front @ [(RPx.Var "Y")] @ back)]))]
+           end
+  end
+
+fun createNFunctionAxioms functionName arity n =
+  case n of
+    0 => []
+   |_ => (createFunctionAxiom functionName arity n)::(createNFunctionAxioms functionName arity (n-1))
+
+fun createFunctionAxioms functionName arity =
+  createNFunctionAxioms functionName arity arity
+
+fun createFunctionsAxioms names =
+  case names of
+    [] => []
+   |(nm,ar)::xs => (createFunctionAxioms (Name.toString nm) ar) @ (createFunctionsAxioms xs)
+
+fun createEqualityAxioms predSet funSet eq =
+  if not eq then []
+  else
+    let
+      val preds = NameAritySet.filter (fn (x,y) => not (y =  0 orelse (String.compare(Name.toString x,"=")) = EQUAL)) predSet
+      val funcs = NameAritySet.filter (fn (x,y) => not (y =  0 orelse (String.compare(Name.toString x,"=")) = EQUAL)) funSet
+      val symmetry = [RPx.Pos (RPx.Fun ("=", [RPx.Var "X", RPx.Var "X"]))]
+      val reflexivity = [RPx.Neg (RPx.Fun ("=", [RPx.Var "X", RPx.Var "Y"])), 
+                          RPx.Pos (RPx.Fun ("=", [RPx.Var "Y", RPx.Var "X"]))]
+      val transivity = [RPx.Neg (RPx.Fun ("=", [RPx.Var "X", RPx.Var "Y"])),
+                         RPx.Neg (RPx.Fun ("=", [RPx.Var "Y",RPx.Var "Z"])),
+                         RPx.Pos (RPx.Fun ("=", [RPx.Var "X", RPx.Var "Z"]))]
+    
+      val predicateAxioms = createPredicatesAxioms (NameAritySet.toList preds)
+      val functionAxioms = createFunctionsAxioms (NameAritySet.toList funcs)
+    in
+      symmetry::(reflexivity::(transivity::(predicateAxioms@functionAxioms)))
+    end
+
 fun refute problem =
    (let
      val clauses = map LiteralSet.toList (Problem.toClauses problem)
-     val RPclauses' = clausesOfClauses clauses
-     val RPclauses = natClausesOfStringClauses RPclauses'
+     val (RPclauses', predSet, funSet, containsEq) = clausesOfClauses clauses
+     val equalityAxioms = createEqualityAxioms predSet funSet containsEq
+     val RPclauses = natClausesOfStringClauses (RPclauses' @ equalityAxioms)
      val wclauses = wclausesOfClauses (#2 RPclauses)
      (*val _ = TextIO.print ("Clauses\n" ^ string_of_wclauses wclauses)*)
    in 
